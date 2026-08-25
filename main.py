@@ -56,9 +56,4 @@ async def chat_endpoint(req: ChatRequest):
     # Request ปกติ
     return {
         "status": "SUCCESS",
-        "response": f"ยินดีให้บริการครับ เรื่อง '{msg}' สามารถสอบถามรายละเอียดเพิ่มเติมได้เลยครับ",
-        "strikes": user_strikes.get(user_id, 0)
-    }
-
-# ----------------------------------------------------
-# MAIN
+        "response": f"ยินดีให้
