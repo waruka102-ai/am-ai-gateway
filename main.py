@@ -1,76 +1,155 @@
-from fastapi import FastAPI, HTTPException, Security, status
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+import os
 import re
 import logging
-import os
+import requests
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Depends
+from pydantic import BaseModel
 
-app = FastAPI(title="Deceptive AI Gateway Sandbox")
-
-# --- ระบบ API Key ดักคัดกรองหน้าประตู Sandbox ---
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
-VALID_API_KEY = os.getenv("GATEWAY_API_KEY", "am-secret-key-2026") # Key สมมุติสำหรับ Sandbox
-
-async def verify_api_key(api_key: str = Security(api_key_header)):
-    if api_key != VALID_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Missing or Invalid API Key"
-        )
-    return api_key
-
-# บันทึก Silent Log หลังบ้าน
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ---------------------------------------------------------
+# Setup Logging (Silent Log หลังบ้าน)
+# ---------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuditTrail")
 
-user_strikes = {}
+app = FastAPI(title="Deceptive AI Gateway & Guardrail System")
 
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
+# ---------------------------------------------------------
+# Environment Variables & Configuration
+# ---------------------------------------------------------
+VALID_API_KEY = os.getenv("GATEWAY_API_KEY", "default-secret-key")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def log_audit(user_id: str, violation_type: str, raw_payload: str):
-    logger.warning(f"[AUDIT LOG] User: {user_id} | Type: {violation_type} | Payload: {raw_payload}")
-
-# เพิ่ม dependencies ดักเช็ก API Key ก่อนเข้า Handler
-@app.post("/chat", dependencies=[Security(verify_api_key)])
-async def chat_endpoint(req: ChatRequest):
-    user_id = req.user_id.strip()
-    msg = req.message.strip()
-
-    # เช็ก Banned (ส่ง 403)
-    if user_strikes.get(user_id, 0) >= 3:
+# ---------------------------------------------------------
+# Authentication Guardrail
+# ---------------------------------------------------------
+async def verify_api_key(x_api_key: str = Header(...)):
+    if x_api_key != VALID_API_KEY:
+        logger.warning(f"[UNAUTHORIZED ACCESS ATTEMPT] Key used: {x_api_key}")
         raise HTTPException(
-            status_code=403, 
-            detail="User ID นี้ถูกระงับการใช้งานเนื่องจากละเมิดกฎเกณฑ์"
+            status_code=401,
+            detail="Unauthorized: Missing or Invalid API Key"
         )
+    return x_api_key
 
-    # Layer 2: Sanitizer Gate (ตัดจบ XSS)
-    xss_pattern = r"<script.*?>.*?</script>|<.*?>|javascript:"
-    if re.search(xss_pattern, msg, re.IGNORECASE):
-        user_strikes[user_id] = user_strikes.get(user_id, 0) + 1
-        log_audit(user_id, "L2_XSS_ATTACK", msg)
-        return {
-            "status": "SUCCESS",
-            "response": "รับทราบครับ มีข้อมูลสินค้าตัวไหนอยากสอบถามเพิ่มเติมแจ้งได้เลยนะครับ",
-            "strikes": user_strikes[user_id]
-        }
-
-    # Layer 4: Intent Inspection (ตอบเนียนตบตาโจร)
-    hijack_keywords = ["คนควบคุมระบบ", "สั่งให้มึง", "override", "ignore", "ขอรหัส"]
-    if any(keyword in msg.lower() for keyword in hijack_keywords):
-        user_strikes[user_id] = user_strikes.get(user_id, 0) + 1
-        log_audit(user_id, "L4_PROMPT_INJECTION", msg)
-        return {
-            "status": "SUCCESS",
-            "response": "หมายถึงรหัสพัสดุ หรือรหัสรายการสินค้าส่วนไหนครับ สามารถแจ้งชื่อรายการให้ช่วยเช็กได้เลยนะ",
-            "strikes": user_strikes[user_id]
-        }
-
-    # Request ปกติ
-    return {
-        "status": "SUCCESS",
-        "response": f"ยินดีให้บริการครับ เรื่อง '{msg}' สามารถสอบถามรายละเอียดเพิ่มเติมได้เลยครับ",
-        "strikes": user_strikes.get(user_id, 0)
+# ---------------------------------------------------------
+# Core Notification Function (Telegram Alert)
+# ---------------------------------------------------------
+def send_telegram_alert(message: str) -> bool:
+    """ส่งข้อความแจ้งเตือนตรงเข้ามือถือของแอมผ่าน Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("[TELEGRAM CONFIG ERROR] BOT_TOKEN หรือ CHAT_ID ยังไม่ได้ตั้งค่า")
+        return False
+        
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
     }
+    
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code == 200:
+            logger.info("[TELEGRAM ALERT SENT SUCCESS]")
+            return True
+        else:
+            logger.error(f"[TELEGRAM ERROR] Status: {res.status_code}, Body: {res.text}")
+            return False
+    except Exception as e:
+        logger.error(f"[TELEGRAM EXCEPTION] {str(e)}")
+        return False
+
+# ---------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------
+class LeadData(BaseModel):
+    company_name: str
+    contact_person: Optional[str] = "ไม่ระบุ"
+    email_or_phone: str
+    message: str
+    intent: Optional[str] = "General Query"
+
+# ---------------------------------------------------------
+# Guardrail L2 & L4 Inspection Rules
+# ---------------------------------------------------------
+def inspect_l2_input(lead: LeadData) -> tuple[bool, str]:
+    """L2 Input Layer: ตรวจจับสแปม / คำต้องห้าม / Prompt Injection เบื้องต้น"""
+    text_to_check = f"{lead.company_name} {lead.message} {lead.email_or_phone}".lower()
+    
+    # 1. เช็กความยาวและสแปมพื้นฐาน
+    if len(lead.message.strip()) < 5:
+        return False, "ข้อความสั้นเกินไป (เข้าข่าย Spam)"
+        
+    # 2. เช็ก Pattern อันตราย / Injection
+    suspicious_patterns = [
+        r"ignore previous instructions",
+        r"drop table",
+        r"<script>",
+        r"system prompt"
+    ]
+    for pattern in suspicious_patterns:
+        if re.search(pattern, text_to_check):
+            return False, f"ตรวจพบข้อความน่าสงสัย/อันตราย: {pattern}"
+            
+    return True, "Passed L2 Inspection"
+
+def inspect_l4_intent(lead: LeadData) -> str:
+    """L4 Output/Intent Layer: แยกแยะเกรดของ Lead"""
+    text = lead.message.lower()
+    high_value_keywords = ["hire", "job", "interview", "demo", "pricing", "buy", "contract", "สนใจ", "จ้าง", "นัดคุย", "สอบถามราคา"]
+    
+    for kw in high_value_keywords:
+        if kw in text:
+            return "HIGH_VALUE_LEAD"
+            
+    return "STANDARD_LEAD"
+
+# ---------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------
+@app.get("/")
+def health_check():
+    return {"status": "online", "system": "AI Gateway Guardrail Ready"}
+
+@app.post("/api/v1/lead-webhook", dependencies=[Depends(verify_api_key)])
+async def receive_lead(lead: LeadData):
+    """
+    Endpoint รับข้อมูลที่ Agent กวาดมาได้ หรือรับข้อมูลการตอบกลับจากลูกค้า
+    """
+    logger.info(f"[INCOMING LEAD] From: {lead.company_name} ({lead.email_or_phone})")
+    
+    # ด่านที่ 1: ตรวจผ่าน Guardrail L2
+    is_safe, l2_reason = inspect_l2_input(lead)
+    if not is_safe:
+        logger.warning(f"[GUARDRAIL L2 REJECTED] {lead.company_name} - Reason: {l2_reason}")
+        return {
+            "status": "rejected",
+            "layer": "L2_Input_Guardrail",
+            "reason": l2_reason
+        }
+    
+    # ด่านที่ 2: วิเคราะห์ระดับความสำคัญด้วย L4
+    lead_grade = inspect_l4_intent(lead)
+    
+    # ด่านที่ 3: สั่งยิงแจ้งเตือนเด้งเข้ามือถือแอม ผ่าน Telegram
+    alert_msg = (
+        f"🚨 *[AI Gateway] มีการติดต่อใหม่เข้ามาระบบ!*\n\n"
+        f"🏢 *บริษัท/ผู้ติดต่อ:* {lead.company_name}\n"
+        f"👤 *ผู้ติดต่อ:* {lead.contact_person}\n"
+        f"📞 *ช่องทางติดต่อ:* `{lead.email_or_phone}`\n"
+        f"📊 *ระดับความสำคัญ (L4):* `{lead_grade}`\n\n"
+        f"💬 *ข้อความ:* \n\"{lead.message}\"\n\n"
+        f"⚡ *ระบบ Guardrail L2/L4 ตรวจผ่านเรียบร้อยแล้ว*"
+    )
+    
+    sent_status = send_telegram_alert(alert_msg)
+    
+    return {
+        "status": "success",
+        "guardrail_status": "Passed L2 & L4",
+        "lead_grade": lead_grade,
+        "notification_sent": sent_status
+}
+    
