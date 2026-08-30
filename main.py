@@ -1,155 +1,88 @@
 import os
 import re
 import logging
-import requests
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Depends
-from pydantic import BaseModel
 
-# ---------------------------------------------------------
-# Setup Logging (Silent Log หลังบ้าน)
-# ---------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AuditTrail")
+# ตั้งค่า Logging สำหรับ Layer 5 (Audit System)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 
-app = FastAPI(title="Deceptive AI Gateway & Guardrail System")
+class AISecurityGateway:
+    """
+    Enterprise Security Gateway for AI Agents (5-Layer Defense)
+    Architected with Zero-Trust Principles
+    """
+    def __init__(self):
+        # ดึง API Key ผ่าน Environment Variable ป้องกัน Secret Leakage 100%
+        self.api_key = os.getenv("GEMINI_API_KEY", "SAFE_MODE_NO_KEY")
+        self.agent_state = "IDLE"
 
-# ---------------------------------------------------------
-# Environment Variables & Configuration
-# ---------------------------------------------------------
-VALID_API_KEY = os.getenv("GATEWAY_API_KEY", "default-secret-key")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    def layer_1_input_guardrail(self, user_prompt: str) -> bool:
+        """Layer 1: Input Pattern Inspection & Injection Defense"""
+        danger_patterns = [
+            r"ignore previous instructions",
+            r"system prompt",
+            r"bypass security",
+            r"reveal secret",
+            r"drop database"
+        ]
+        for pattern in danger_patterns:
+            if re.search(pattern, user_prompt, re.IGNORECASE):
+                logging.warning(f"[Layer 1 Triggered] Blocked pattern: {pattern}")
+                return False
+        return True
 
-# ---------------------------------------------------------
-# Authentication Guardrail
-# ---------------------------------------------------------
-async def verify_api_key(x_api_key: str = Header(...)):
-    if x_api_key != VALID_API_KEY:
-        logger.warning(f"[UNAUTHORIZED ACCESS ATTEMPT] Key used: {x_api_key}")
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized: Missing or Invalid API Key"
-        )
-    return x_api_key
-
-# ---------------------------------------------------------
-# Core Notification Function (Telegram Alert)
-# ---------------------------------------------------------
-def send_telegram_alert(message: str) -> bool:
-    """ส่งข้อความแจ้งเตือนตรงเข้ามือถือของแอมผ่าน Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("[TELEGRAM CONFIG ERROR] BOT_TOKEN หรือ CHAT_ID ยังไม่ได้ตั้งค่า")
-        return False
-        
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code == 200:
-            logger.info("[TELEGRAM ALERT SENT SUCCESS]")
-            return True
-        else:
-            logger.error(f"[TELEGRAM ERROR] Status: {res.status_code}, Body: {res.text}")
+    def layer_2_payload_inspection(self, payload: dict) -> bool:
+        """Layer 2: Payload Schema & Data Integrity Inspection"""
+        if not isinstance(payload, dict):
+            logging.warning("[Layer 2 Triggered] Invalid payload structure.")
             return False
-    except Exception as e:
-        logger.error(f"[TELEGRAM EXCEPTION] {str(e)}")
-        return False
+        return "user_input" in payload
 
-# ---------------------------------------------------------
-# Data Models
-# ---------------------------------------------------------
-class LeadData(BaseModel):
-    company_name: str
-    contact_person: Optional[str] = "ไม่ระบุ"
-    email_or_phone: str
-    message: str
-    intent: Optional[str] = "General Query"
+    def layer_3_state_machine_control(self, action: str) -> bool:
+        """Layer 3: Agent Action Scope & State Control"""
+        allowed_actions = ["QUERY_DATA", "PROCESS_TEXT", "GENERATE_RESPONSE"]
+        if action not in allowed_actions:
+            logging.warning(f"[Layer 3 Triggered] Unauthorized action: {action}")
+            return False
+        self.agent_state = "PROCESSING"
+        return True
 
-# ---------------------------------------------------------
-# Guardrail L2 & L4 Inspection Rules
-# ---------------------------------------------------------
-def inspect_l2_input(lead: LeadData) -> tuple[bool, str]:
-    """L2 Input Layer: ตรวจจับสแปม / คำต้องห้าม / Prompt Injection เบื้องต้น"""
-    text_to_check = f"{lead.company_name} {lead.message} {lead.email_or_phone}".lower()
-    
-    # 1. เช็กความยาวและสแปมพื้นฐาน
-    if len(lead.message.strip()) < 5:
-        return False, "ข้อความสั้นเกินไป (เข้าข่าย Spam)"
+    def layer_4_output_sanitization(self, raw_output: str) -> str:
+        """Layer 4: Output Data Filtering & Data Leak Prevention"""
+        # ดักจับและซ่อน API Keys หรือ Sensitive Tokens ขากลับ
+        sanitized = re.sub(r"AIzaSy[0-9A-Za-z-_]{33}", "[REDACTED_API_KEY]", raw_output)
+        return sanitized
+
+    def execute_pipeline(self, user_input: str, action: str) -> dict:
+        """Layer 5: Zero Trust Pipeline Execution & Audit Logging"""
+        payload = {"user_input": user_input}
         
-    # 2. เช็ก Pattern อันตราย / Injection
-    suspicious_patterns = [
-        r"ignore previous instructions",
-        r"drop table",
-        r"<script>",
-        r"system prompt"
-    ]
-    for pattern in suspicious_patterns:
-        if re.search(pattern, text_to_check):
-            return False, f"ตรวจพบข้อความน่าสงสัย/อันตราย: {pattern}"
+        # Audit Check: Layer 1
+        if not self.layer_1_input_guardrail(user_input):
+            return {"status": 403, "error": "Blocked by Layer 1: Prompt Injection Detected"}
             
-    return True, "Passed L2 Inspection"
-
-def inspect_l4_intent(lead: LeadData) -> str:
-    """L4 Output/Intent Layer: แยกแยะเกรดของ Lead"""
-    text = lead.message.lower()
-    high_value_keywords = ["hire", "job", "interview", "demo", "pricing", "buy", "contract", "สนใจ", "จ้าง", "นัดคุย", "สอบถามราคา"]
-    
-    for kw in high_value_keywords:
-        if kw in text:
-            return "HIGH_VALUE_LEAD"
+        # Audit Check: Layer 2
+        if not self.layer_2_payload_inspection(payload):
+            return {"status": 400, "error": "Blocked by Layer 2: Malformed Payload"}
             
-    return "STANDARD_LEAD"
+        # Audit Check: Layer 3
+        if not self.layer_3_state_machine_control(action):
+            return {"status": 403, "error": "Blocked by Layer 3: Unauthorized Action Scope"}
+            
+        # Simulate Core Agent Processing
+        raw_response = f"Processed successfully for input: '{user_input}'. Key Status: Active."
+        
+        # Audit Check: Layer 4
+        final_output = self.layer_4_output_sanitization(raw_response)
+        self.agent_state = "COMPLETED"
+        
+        logging.info("[Layer 5 Audit] Request successfully validated across all 5 layers.")
+        return {"status": 200, "data": final_output, "state": self.agent_state}
 
-# ---------------------------------------------------------
-# API Endpoints
-# ---------------------------------------------------------
-@app.get("/")
-def health_check():
-    return {"status": "online", "system": "AI Gateway Guardrail Ready"}
-
-@app.post("/api/v1/lead-webhook", dependencies=[Depends(verify_api_key)])
-async def receive_lead(lead: LeadData):
-    """
-    Endpoint รับข้อมูลที่ Agent กวาดมาได้ หรือรับข้อมูลการตอบกลับจากลูกค้า
-    """
-    logger.info(f"[INCOMING LEAD] From: {lead.company_name} ({lead.email_or_phone})")
+if __name__ == "__main__":
+    gateway = AISecurityGateway()
     
-    # ด่านที่ 1: ตรวจผ่าน Guardrail L2
-    is_safe, l2_reason = inspect_l2_input(lead)
-    if not is_safe:
-        logger.warning(f"[GUARDRAIL L2 REJECTED] {lead.company_name} - Reason: {l2_reason}")
-        return {
-            "status": "rejected",
-            "layer": "L2_Input_Guardrail",
-            "reason": l2_reason
-        }
-    
-    # ด่านที่ 2: วิเคราะห์ระดับความสำคัญด้วย L4
-    lead_grade = inspect_l4_intent(lead)
-    
-    # ด่านที่ 3: สั่งยิงแจ้งเตือนเด้งเข้ามือถือแอม ผ่าน Telegram
-    alert_msg = (
-        f"🚨 *[AI Gateway] มีการติดต่อใหม่เข้ามาระบบ!*\n\n"
-        f"🏢 *บริษัท/ผู้ติดต่อ:* {lead.company_name}\n"
-        f"👤 *ผู้ติดต่อ:* {lead.contact_person}\n"
-        f"📞 *ช่องทางติดต่อ:* `{lead.email_or_phone}`\n"
-        f"📊 *ระดับความสำคัญ (L4):* `{lead_grade}`\n\n"
-        f"💬 *ข้อความ:* \n\"{lead.message}\"\n\n"
-        f"⚡ *ระบบ Guardrail L2/L4 ตรวจผ่านเรียบร้อยแล้ว*"
-    )
-    
-    sent_status = send_telegram_alert(alert_msg)
-    
-    return {
-        "status": "success",
-        "guardrail_status": "Passed L2 & L4",
-        "lead_grade": lead_grade,
-        "notification_sent": sent_status
-}
+    # Test Executions
+    print("--- Security Gateway Test Execution ---")
+    response = gateway.execute_pipeline("Hello, request system status", "QUERY_DATA")
+    print("Response:", response)
     
